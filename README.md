@@ -1,2 +1,5 @@
-# detr_from_scratch
-'DETR' (Carion et al., 2020) implementation from scratch in PyTorch
+# End-to-End Object Detection with Transformers
+
+# References
+- [1] https://github.com/gokul-pv/DetectionTransformer?tab=readme-ov-file
+- [2] https://github.com/facebookresearch/detr
