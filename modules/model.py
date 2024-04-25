@@ -10,15 +10,24 @@ from torchvision.models import resnet50
 import numpy as np
 import scipy
 import einops
+from einops.layers.torch import Rearrange
 
 from torchvision.models import resnet50, ResNet50_Weights
-from transformer import TransformerEncoder, TransformerDecoder
+from transformer import Transformer
 from iou import GIoULoss
 
 
 class Backbone(nn.Module):
     """
-    ". Starting from the initial image ximg ∈ R3×H0 ×W0 (with 3 color channels2), a conventional CNN backbone generates a lower-resolution activation map f ∈ RC×H×W . Typical values we use are C = 2048 and W = H 32 0 , W0 32 . H,
+    "Starting from the initial image $x_{img} \in \mathbb{R}^{3 \times H_{0}
+    \times W_{0}}$ (with 3 color channels), a conventional CNN backbone generates
+    a lower-resolution activation map $f \in \mathbb{R}^{C \times H \times W}$.
+    Typical values we use are $C = 2048$ and $H, W = \frac{H_{0}}{32},
+    \frac{W_{0}}{32}$."
+    "The backbone is with ImageNet-pretrained ResNet model from `torchvision`
+    with frozen batchnorm layers. We report results with two different backbones:
+    a ResNet-50 and a ResNet-101. The corresponding models are called respectively
+    DETR and DETR-R101."
     """
     def __init__(self):
         super().__init__()
@@ -32,6 +41,27 @@ class Backbone(nn.Module):
 
 
 class DETR(nn.Module):
+    """
+    "A 1x1 convolution reduces the channel dimension of the high-level
+    activation map $f$ from $C$ to a smaller dimension $d$. creating a new
+    feature map $z_{0} \in \mathbb{R}^{d \times H \times W}$. The encoder
+    expects a sequence as input, hence we collapse the spatial dimensions of
+    $z_{0}$ into one dimension, resulting in a $d \times HW$ feature map.
+    "They are then independently decoded into box coordinates and class labels
+    by a feed forward network, resulting $N$ final predictions."
+    "The final prediction is computed by a 3-layer perceptron with ReLU activation
+    function and hidden dimension $d$, and a linear projection layer. The FFN
+    predicts the normalized center coordinates, height and width of the box w.r.t.
+    the input image, and the linear layer predicts the class label using a softmax
+    function."
+    "$N$ is usually much larger than the actual number of objects of interest in
+    an image, an additional special class la- bel ∅ is used to represent that no
+    object is detected within a slot."
+    "All models were trained with $N = 100$ decoder query slots."
+    
+
+    "All transformer weights are initialized with Xavier init."
+    """
     def __init__(
         self,
         num_query_slots=100,
@@ -45,27 +75,6 @@ class DETR(nn.Module):
         stride=32,
         feat_dim=2048,
     ):
-        """
-        "All transformer weights are initialized with Xavier init."
-        "The backbone is with ImageNet-pretrained ResNet model from `torchvision`
-        with frozen batchnorm layers. We report results with two different
-        backbones: a ResNet-50 and a ResNet-101. The corresponding models are
-        called respectively DETR and DETR-R101. we also increase the feature
-        resolution by adding a dilation to the last stage of the backbone and
-        removing a stride from the first convolution of this stage. The
-        corresponding models are called respectively DETR-DC5 and DETR-DC5-R101
-        (dilated C5 stage). This modification increases the resolution by a
-        factor of two, thus improving performance for small objects, at the cost
-        of a 16x higher cost in the self-attentions of the encoder, leading to
-        an overall 2x increase in computational cost."
-        
-        "A 1x1 convolution reduces the channel dimension of the high-level activation map f from C to a smaller dimension d. creating a new feature map z0 ∈ Rd×H×W . The encoder expects a sequence as input, hence we collapse the spatial dimensions of z0 into one dimension, resulting in a d×HW feature map.
-
-        The final prediction is com- puted by a 3-layer perceptron with ReLU activation function and hidden dimen- sion d, and a linear projection layer. The FFN predicts the normalized center coordinates, height and width of the box w.r.t. the input image, and the lin- ear layer predicts the class label using a softmax function.
-        N is usually much larger than the actual number of objects of interest in an image, an additional special class la- bel ∅ is used to represent that no object is detected within a slot. This class plays a similar role to the “background” class in the standard object detection approaches
-        TODO "We add prediction FFNs and Hungarian loss after each decoder layer. All predictions FFNs share their parameters. We use an additional shared layer-norm to normalize the input to the prediction FFNs from different decoder layers.
-        "All models were trained with $N = 100$ decoder query slots."
-        """
         super().__init__()
 
         self.num_query_slots = num_query_slots
@@ -75,16 +84,16 @@ class DETR(nn.Module):
 
         self.backbone = Backbone()
         self.giou_loss = GIoULoss()
-        self.conv = nn.Conv2d(feat_dim, width, 1, 1, 0)
-        self.encoder = TransformerEncoder(
-            num_heads=num_encoder_heads,
-            num_layers=num_encoder_layers,
-            width=width,
+        self.to_sequence = nn.Sequential(
+            nn.Conv2d(feat_dim, width, 1, 1, 0),
+            Rearrange("b l h w -> b (h w) l"),
         )
-        self.decoder = TransformerDecoder(
-            num_heads=num_decoder_heads,
-            num_layers=num_decoder_layers,
+        self.transformer = Transformer(
             width=width,
+            num_encoder_heads=num_encoder_heads,
+            num_encoder_layers=num_encoder_layers,
+            num_decoder_heads=num_decoder_heads,
+            num_decoder_layers=num_decoder_layers,
         )
         self.obj_query = nn.Embedding(num_query_slots, width).weight
         self.bbox_ffn = nn.Sequential(
@@ -96,7 +105,7 @@ class DETR(nn.Module):
             nn.Sigmoid(),
         )
         self.cls_ffn = nn.Sequential(
-            nn.Linear(width, num_classes),
+            nn.Linear(width, num_classes + 1),
             nn.Softmax(dim=-1),
         )
 
@@ -108,14 +117,14 @@ class DETR(nn.Module):
             self.img_size // self.stride,
             self.img_size // self.stride,
         )
-        x = self.conv(x)
-        x = einops.rearrange(x, pattern="b l h w -> b (h w) l")
-        enc_out = self.encoder(x)
-        x = self.decoder(
-            einops.repeat(self.obj_query, pattern="n d -> b n d", b=image.size(0)),
-            enc_out,
+        x = self.to_sequence(x)
+        x = self.transformer(
+            x=x,
+            query=torch.zeros_lie(x),
+            obj_query=einops.repeat(
+                self.obj_query, pattern="n d -> b n d", b=image.size(0),
+            ),
         )
-
         pred_bbox = self.bbox_ffn(x)
         pred_prob = self.cls_ffn(x)
         return pred_bbox, pred_prob
@@ -136,6 +145,7 @@ class DETR(nn.Module):
         "We use linear combination of $\mathcal{l}$ and GIoU losses for
         bounding box regression with $\lambda_{L1} = 5$ and
         $\lambda_{\text{iou}} = 2$ weights respectively."
+        "All losses are normalized by the number of objects inside the batch."
         """
         batched_pred_bbox, batched_pred_prob = self(image)
 
