@@ -1,20 +1,21 @@
-# References
+# References:
     # https://github.com/facebookresearch/detr/blob/main/models/matcher.py
-    # https://github.com/facebookresearch/detr/blob/main/models/transformer.py
 
+import sys
+sys.path.insert(0, "/home/jbkim/Desktop/workspace/DETR")
 import scipy.optimize
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torchvision.models import resnet50
-import numpy as np
 import scipy
 import einops
 from einops.layers.torch import Rearrange
-
 from torchvision.models import resnet50, ResNet50_Weights
-from transformer import Transformer
-from iou import GIoULoss
+import torch.nn.functional as F
+import numpy as np
+
+from modules.transformer import Transformer
+from modules.iou import GIoULoss
 
 
 class Backbone(nn.Module):
@@ -58,9 +59,7 @@ class DETR(nn.Module):
     an image, an additional special class la- bel ∅ is used to represent that no
     object is detected within a slot."
     "All models were trained with $N = 100$ decoder query slots."
-    
-
-    "All transformer weights are initialized with Xavier init."
+    "The decoder receives queries (initially set to zero)."
     """
     def __init__(
         self,
@@ -78,6 +77,7 @@ class DETR(nn.Module):
         super().__init__()
 
         self.num_query_slots = num_query_slots
+        self.num_classes = num_classes
         self.img_size = img_size
         self.stride = stride
         self.feat_dim = feat_dim
@@ -95,6 +95,7 @@ class DETR(nn.Module):
             num_decoder_heads=num_decoder_heads,
             num_decoder_layers=num_decoder_layers,
         )
+        self.query = torch.zeros((self.num_query_slots, width))
         self.obj_query = nn.Embedding(num_query_slots, width).weight
         self.bbox_ffn = nn.Sequential(
             nn.Linear(width, width),
@@ -119,9 +120,11 @@ class DETR(nn.Module):
         )
         x = self.to_sequence(x)
         x = self.transformer(
-            x=x,
-            query=torch.zeros_lie(x),
-            obj_query=einops.repeat(
+            image_feat=x,
+            q=einops.repeat(
+                self.query, pattern="n d -> b n d", b=image.size(0),
+            ),
+            out_pos_enc=einops.repeat(
                 self.obj_query, pattern="n d -> b n d", b=image.size(0),
             ),
         )
@@ -139,12 +142,24 @@ class DETR(nn.Module):
         giou_weight=2,
     ):
         """
-        "Lmatch (yi , ŷσ(i) ) is a pair-wise matching cost between ground truth yi and a prediction with index σ(i). This optimal assignment is computed efficiently with the Hungarian algorithm, following prior work (e.g. [43]). The matching cost takes into account both the class prediction and the sim- ilarity of predicted and ground truth boxes. Each element i of the ground truth set can be seen as a yi = (ci , bi ) where ci is the target class label (which may be ∅) and bi ∈ [0, 1]4 is a vector that defines ground truth box cen- ter coordinates and its height and width relative to the image size. For the prediction with index σ(i) we define probability of class ci as p̂σ(i) (ci ) and the predicted box as b̂σ(i) . With these notations we define $\mathcal{L}_{\text{match}}(y_{i}, \hat{y}_{\sigma(i)})$ as
+        "$\mathcal{L}_{\text{match}}(y_{i}, \hat{y}_{\sigma(i)})$ is a pair-wise
+        matching cost between ground truth $y_{i}$ and a prediction with index
+        $\sigma(i)$. This optimal assignment is computed efficiently with the
+        Hungarian algorithm. The matching cost takes into account both the class
+        prediction and the similarity of predicted and ground truth boxes. Each
+        element $i$ of the ground truth set can be seen as a $y_{i}$
+        = (c_{i}, b_{i})$ where $c_{i}$ is the target class label (which may be
+        $\phi$) and $b_{i} \in [0, 1]$ is a vector that defines ground truth box
+        center coordinates and its height and width relative to the image size.
+        For the prediction with index $\sigma(i)$ we define probability of class
+        c_{i} as $\hat{p}_{\sigma(i)}(c_{i})$ and the predicted box as
+        $\hat{b}_{\sigma(i)}$. With these notations we define
+        $\mathcal{L}_{\text{match}}(y_{i}, \hat{y}_{\sigma(i)})$ as
         $-\mathbb{1}_{\{c_{i} \neq \phi\}}\hat{p}_{\sigma(i)}(c_{i}) +
         \mathbb{1}_{\{c_{i} \neq \phi\}}\mathcal{L}_{\text{box}}(b_{i}, \hat{b}_{\sigma(i)})$.
-        "We use linear combination of $\mathcal{l}$ and GIoU losses for
-        bounding box regression with $\lambda_{L1} = 5$ and
-        $\lambda_{\text{iou}} = 2$ weights respectively."
+        "We use linear combination of $\mathcal{l}$ and GIoU losses for bounding
+        box regression with $\lambda_{L1} = 5$ and $\lambda_{\text{iou}} = 2$
+        weights respectively."
         "All losses are normalized by the number of objects inside the batch."
         """
         batched_pred_bbox, batched_pred_prob = self(image)
@@ -170,8 +185,9 @@ class DETR(nn.Module):
             loss += l1_weight * torch.sum(
                 torch.abs(pred_bbox[pred_indices] - gt_bbox[gt_indices])
             )
+            loss /= label.size(0)
             sum_losses += loss
-        sum_losses /= (image.size(0) * self.num_query_slots)
+        sum_losses /= image.size(0)
         return sum_losses
 
 
@@ -179,31 +195,14 @@ if __name__ == "__main__":
     import random
 
     batch_size = 4
-    num_query_slots = 40
-    num_classes = 80
-
-    num_objs = [random.randint(0, 20) for _ in range(batch_size)]
-    labels = [torch.randint(0, num_classes, size=(i,)) for i in num_objs]
-    gt_bboxes = [torch.rand((i, 4)) for i in num_objs]
 
     model = DETR()
+    num_objs = [random.randint(0, 20) for _ in range(batch_size)]
+    labels = [torch.randint(0, model.num_classes, size=(i,)) for i in num_objs]
+    gt_bboxes = [torch.rand((i, 4)) for i in num_objs]
+
     image = torch.randn((4, 3, 512, 512))
     loss = model.get_loss(
         image=image, labels=labels, gt_bboxes=gt_bboxes,
     )
     print(loss)
-
-
-    # # pred_orders = [random.sample(range(i), i) for i in num_objs]
-    # pred_cls_logits = torch.rand((batch_size, num_query_slots, num_classes))
-    # pred_bboxes = torch.rand((batch_size, num_query_slots, 4))
-    # pred_bboxes.shape
-
-    # batch_idx = 0
-    # label = labels[batch_idx] # "$c_{i}$"
-    # gt_bbox = gt_bboxes[batch_idx] # "$b_{i}$"
-    # pred_bbox = pred_bboxes[batch_idx]
-    # pred_order = pred_orders[batch_idx] # "$\sigma(i)$"
-    # pred_cls_logit = pred_cls_logits[batch_idx]
-    
-

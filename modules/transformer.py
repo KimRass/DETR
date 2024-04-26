@@ -1,3 +1,6 @@
+# References:
+    # https://github.com/facebookresearch/detr/blob/main/models/transformer.py
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -24,9 +27,7 @@ class SinePositionalEncoding(nn.Module):
 
     def forward(self, x):
         return x + einops.repeat(
-            self.obj_query.pe_mat.to(x.device),
-            pattern="l d -> b l d",
-            b=x.size(0),
+            self.pe_mat.to(x.device), pattern="l d -> b l d", b=x.size(0),
         )[:, : x.size(1), :]
 
 
@@ -119,8 +120,9 @@ class EncoderLayer(nn.Module):
 
     def forward(self, x):
         skip = x
-        q = k = self.spatial_pos_enc(x)
-        x, _ = self.self_attn(q=q, k=k, v=x)
+        x, _ = self.self_attn(
+            q=self.spatial_pos_enc(x), k=self.spatial_pos_enc(x), v=x,
+        )
         x = self.self_attn_drop(x)
         x = self.self_attn_norm(x + skip)
         
@@ -168,7 +170,6 @@ class DecoderLayer(nn.Module):
     encoding (object queries), and encoder memory, and produces the final set
     of predicted class labels and bounding boxes through multiple multi-head
     self-attention and decoder-encoder attention."
-    "Our model decodes the $N$ objects in parallel at each decoder layer."
     "These input embeddings are learnt positional encodings that we refer to as
     'object queries', and similarly to the encoder, we add them to the input of
     each attention layer. The $N$ object queries are transformed into an output
@@ -206,15 +207,17 @@ class DecoderLayer(nn.Module):
         self.ffn_drop = nn.Dropout(drop_prob)
         self.ffn_norm = nn.LayerNorm(width)
 
-    def forward(self, query, enc_mem, obj_query):
-        skip = query
-        x, _ = self.self_attn(q=query + obj_query, k=query + obj_query, v=query)
+    def forward(self, q, enc_mem, out_pos_enc):
+        skip = q
+        x, _ = self.self_attn(
+            q=q + out_pos_enc, k=q + out_pos_enc, v=q,
+        )
         x = self.self_attn_drop(x)
         x = self.self_attn_norm(x + skip)
 
         skip = x
         x, _ = self.enc_dec_attn(
-            q=x + obj_query, k=self.spatial_pos_enc(enc_mem), v=enc_mem,
+            q=x + out_pos_enc, k=self.spatial_pos_enc(enc_mem), v=enc_mem,
         )
         x = self.enc_dec_attn_drop(x)
         x = self.enc_dec_attn_norm(x + skip)
@@ -227,16 +230,13 @@ class DecoderLayer(nn.Module):
 
 
 class Decoder(nn.Module):
-    """
-    "Transformer module uses the standard Transformer decoder [41] to compute from image features F and N learnable positional embeddings (i.e., queries) its output, i.e., N per-segment embeddings Q 2 RCQ N of dimension CQ that encode global information about each segment MaskFormer predicts. Similarly to [4], the decoder yields all predictions in parallel."
-    """
     def __init__(
         self,
         num_heads,
         width,
         num_layers,
+        drop_prob,
         mlp_width=None,
-        drop_prob=0.1,
     ):
         super().__init__()
 
@@ -254,13 +254,18 @@ class Decoder(nn.Module):
             ]
         )
 
-    def forward(self, x, enc_mem):
+    def forward(self, q, enc_mem, out_pos_enc):
         for dec_layer in self.dec_stack:
-            x = dec_layer(x, enc_mem=enc_mem)
-        return x
+            q = dec_layer(
+                q=q, enc_mem=enc_mem, out_pos_enc=out_pos_enc,
+            )
+        return q
 
 
 class Transformer(nn.Module):
+    """
+    "All transformer weights are initialized with Xavier init."
+    """
     def __init__(
         self,
         width=512,
@@ -285,10 +290,9 @@ class Transformer(nn.Module):
             drop_prob=drop_prob,
         )
 
-    def forward(self, x, query, obj_query):
-        enc_mem = self.encoder(x)
-        x = self.decoder(query=query, enc_mem=enc_mem, obj_query=obj_query)
-        return x
+    def forward(self, image_feat, q, out_pos_enc):
+        enc_mem = self.encoder(image_feat)
+        return self.decoder(q=q, enc_mem=enc_mem, out_pos_enc=out_pos_enc)
 
 
 if __name__ == "__main__":
