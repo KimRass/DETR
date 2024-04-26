@@ -265,6 +265,7 @@ class Decoder(nn.Module):
 class Transformer(nn.Module):
     """
     "All transformer weights are initialized with Xavier init."
+    "The transformer is trained with default dropout of 0.1."
     """
     def __init__(
         self,

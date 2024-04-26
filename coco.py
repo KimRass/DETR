@@ -1,7 +1,3 @@
-# Source: https://cocodataset.org/#download
-# References:
-    # https://www.kaggle.com/code/blondinka/how-to-do-augmentations-for-instance-segmentation
-
 import torch
 import cv2
 from pycocotools.coco import COCO
@@ -22,10 +18,6 @@ from lsj import LargeScaleJittering
 
 
 class COCODS(Dataset):
-    """
-    "The input images are batched together, applying 0-padding adequately to ensure
-    they all have the same dimensions (H0;W0) as the largest image of the batch."
-    """
     def __init__(self, annot_path, img_dir, transform=None, img_size=512):
         self.transform = transform
         self.img_size = img_size

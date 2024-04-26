@@ -161,6 +161,10 @@ class DETR(nn.Module):
         box regression with $\lambda_{L1} = 5$ and $\lambda_{\text{iou}} = 2$
         weights respectively."
         "All losses are normalized by the number of objects inside the batch."
+        TODO: "At inference time, some slots predict empty class. To optimize
+        for AP, we override the prediction of these slots with the second
+        highest scoring class, using the corresponding confidence. This improves
+        AP by 2 points compared to filtering out empty slots."
         """
         batched_pred_bbox, batched_pred_prob = self(image)
 
