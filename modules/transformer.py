@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import einops
+from einops.layers.torch import Rearrange
 
 
 class SinePositionalEncoding(nn.Module):
@@ -36,34 +37,31 @@ class MultiHeadAttention(nn.Module):
         super().__init__()
     
         self.num_heads = num_heads
-        self.head_dim = width // num_heads
 
         self.q_proj = nn.Linear(width, width, bias=False)
         self.k_proj = nn.Linear(width, width, bias=False)
         self.v_proj = nn.Linear(width, width, bias=False)
+        self.to_multi_heads = Rearrange("b i (n h) -> b i n h", n=num_heads)
         self.scale = width ** (-0.5)
         self.attn_drop = nn.Dropout(drop_prob)
+        self.to_one_head = Rearrange("b i n h -> b i (n h)")
         self.out_proj = nn.Linear(width, width, bias=False)
 
     def forward(self, q, k, v):
-        b, i, _ = q.shape
-        _, j, _ = k.shape
-
         q = self.q_proj(q)
         k = self.k_proj(k)
         v = self.v_proj(v)
-
-        q = q.view(b, self.num_heads, i, self.head_dim)
-        k = k.view(b, self.num_heads, j, self.head_dim)
-        v = v.view(b, self.num_heads, j, self.head_dim)
-
-        attn_score = torch.einsum("bnid,bnjd->bnij", q, k) * self.scale
-        attn_weight = F.softmax(attn_score, dim=3)
-
-        attn_weight_drop = self.attn_drop(attn_weight)
-        x = torch.einsum("bnij,bnjd->bnid", attn_weight_drop, v)
-        x = einops.rearrange(x, pattern="b n i d -> b i (n d)")
-
+        attn_score = torch.einsum(
+            "binh,bjnh->bnij", self.to_multi_heads(q), self.to_multi_heads(k),
+        ) * self.scale
+        attn_weight = F.softmax(attn_score, dim=-1)
+        x = self.to_one_head(
+            torch.einsum(
+                "bnij,bjnh->binh",
+                self.attn_drop(attn_weight),
+                self.to_multi_heads(v),
+            )
+        )
         x = self.out_proj(x)
         return x, attn_weight
 
@@ -81,6 +79,22 @@ class FFN(nn.Module):
 
     def forward(self, x):
         return self.layers(x)
+
+
+class ResidualConnection(nn.Module):
+    def __init__(self, fn, width, drop_prob):
+        super().__init__()
+
+        self.fn = fn
+        self.res_drop = nn.Dropout(drop_prob)
+        self.norm = nn.LayerNorm(width)
+
+    def forward(self, skip, **kwargs):
+        x = self.fn(**kwargs)
+        x = self.res_drop(x)
+        x += skip
+        x = self.norm(x)
+        return x
 
 
 class EncoderLayer(nn.Module):
@@ -102,35 +116,30 @@ class EncoderLayer(nn.Module):
     ):
         super().__init__()
 
-        self.num_heads = num_heads
-        self.width = width
-        self.mlp_width = mlp_width
-
         self.spatial_pos_enc = SinePositionalEncoding(embed_dim=width)
         self.self_attn = MultiHeadAttention(
             width=width, num_heads=num_heads, drop_prob=drop_prob,
         )
-        self.self_attn_drop = nn.Dropout(drop_prob)
-        self.self_attn_norm = nn.LayerNorm(width)
         self.ffn = FFN(
             width=width, mlp_width=mlp_width, drop_prob=drop_prob,
         )
-        self.ffn_drop = nn.Dropout(drop_prob)
-        self.ffn_norm = nn.LayerNorm(width)
+
+        self.self_attn_res_conn = ResidualConnection(
+            fn=lambda x: self.self_attn(
+                q=self.spatial_pos_enc(x), k=self.spatial_pos_enc(x), v=x,
+            )[0],
+            width=width,
+            drop_prob=drop_prob,
+        )
+        self.ffn_res_conn = ResidualConnection(
+            fn=self.ffn,
+            width=width,
+            drop_prob=drop_prob,
+        )
 
     def forward(self, x):
-        skip = x
-        x, _ = self.self_attn(
-            q=self.spatial_pos_enc(x), k=self.spatial_pos_enc(x), v=x,
-        )
-        x = self.self_attn_drop(x)
-        x = self.self_attn_norm(x + skip)
-        
-        skip = x
-        x = self.ffn(x)
-        x = self.ffn_drop(x)
-        x = self.ffn_norm(x + skip)
-        return x
+        x = self.self_attn_res_conn(skip=x, x=x)
+        return self.ffn_res_conn(skip=x, x=x)
 
 
 class Encoder(nn.Module):
@@ -192,40 +201,40 @@ class DecoderLayer(nn.Module):
         self.self_attn = MultiHeadAttention(
             width=width, num_heads=num_heads, drop_prob=drop_prob,
         )
-        self.self_attn_drop = nn.Dropout(drop_prob)
-        self.self_attn_norm = nn.LayerNorm(width)
         self.enc_dec_attn = MultiHeadAttention(
             width=width, num_heads=num_heads, drop_prob=drop_prob,
         )
-        self.enc_dec_attn_drop = nn.Dropout(drop_prob)
-        self.enc_dec_attn_norm = nn.LayerNorm(width)
         self.ffn = FFN(
             width=width,
             mlp_width=mlp_width,
             drop_prob=drop_prob,
         )
-        self.ffn_drop = nn.Dropout(drop_prob)
-        self.ffn_norm = nn.LayerNorm(width)
 
-    def forward(self, q, enc_mem, out_pos_enc):
-        skip = q
-        x, _ = self.self_attn(
-            q=q + out_pos_enc, k=q + out_pos_enc, v=q,
+        self.self_attn_res_conn = ResidualConnection(
+            fn=lambda x, out_pos_enc: self.self_attn(
+                q=x + out_pos_enc, k=x + out_pos_enc, v=x)[0],
+            width=width,
+            drop_prob=drop_prob,
         )
-        x = self.self_attn_drop(x)
-        x = self.self_attn_norm(x + skip)
-
-        skip = x
-        x, _ = self.enc_dec_attn(
-            q=x + out_pos_enc, k=self.spatial_pos_enc(enc_mem), v=enc_mem,
+        self.enc_dec_attn_res_conn = ResidualConnection(
+            fn=lambda x, enc_mem, out_pos_enc: self.enc_dec_attn(
+                q=x + out_pos_enc, k=self.spatial_pos_enc(enc_mem), v=enc_mem,
+            )[0],
+            width=width,
+            drop_prob=drop_prob,
         )
-        x = self.enc_dec_attn_drop(x)
-        x = self.enc_dec_attn_norm(x + skip)
+        self.ffn_res_conn = ResidualConnection(
+            fn=self.ffn, width=width, drop_prob=drop_prob,
+        )
 
-        skip = x
-        x = self.ffn(x)
-        x = self.ffn_drop(x)
-        x = self.ffn_norm(x + skip)
+    def forward(self, query, enc_mem, out_pos_enc):
+        x = self.self_attn_res_conn(
+            skip=query, x=query, out_pos_enc=out_pos_enc,
+        )
+        x = self.enc_dec_attn_res_conn(
+            skip=x, x=x, enc_mem=enc_mem, out_pos_enc=out_pos_enc,
+        )
+        x = self.ffn_res_conn(skip=x, x=x)
         return x
 
 
@@ -254,12 +263,12 @@ class Decoder(nn.Module):
             ]
         )
 
-    def forward(self, q, enc_mem, out_pos_enc):
+    def forward(self, query, enc_mem, out_pos_enc):
         for dec_layer in self.dec_stack:
-            q = dec_layer(
-                q=q, enc_mem=enc_mem, out_pos_enc=out_pos_enc,
+            query = dec_layer(
+                query=query, enc_mem=enc_mem, out_pos_enc=out_pos_enc,
             )
-        return q
+        return query
 
 
 class Transformer(nn.Module):
@@ -291,10 +300,8 @@ class Transformer(nn.Module):
             drop_prob=drop_prob,
         )
 
-    def forward(self, image_feat, q, out_pos_enc):
+    def forward(self, image_feat, query, out_pos_enc):
         enc_mem = self.encoder(image_feat)
-        return self.decoder(q=q, enc_mem=enc_mem, out_pos_enc=out_pos_enc)
-
-
-if __name__ == "__main__":
-    transformer = Transformer()
+        return self.decoder(
+            query=query, enc_mem=enc_mem, out_pos_enc=out_pos_enc,
+        )

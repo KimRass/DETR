@@ -2,7 +2,8 @@
     # https://github.com/facebookresearch/detr/blob/main/models/matcher.py
 
 import sys
-sys.path.insert(0, "/home/jbkim/Desktop/workspace/DETR")
+# sys.path.insert(0, "/home/jbkim/Desktop/workspace/DETR")
+sys.path.insert(0, "/Users/jongbeomkim/Desktop/workspace/DETR")
 import scipy.optimize
 import torch
 import torch.nn as nn
@@ -121,7 +122,7 @@ class DETR(nn.Module):
         x = self.to_sequence(x)
         x = self.transformer(
             image_feat=x,
-            q=einops.repeat(
+            query=einops.repeat(
                 self.query, pattern="n d -> b n d", b=image.size(0),
             ),
             out_pos_enc=einops.repeat(
@@ -189,8 +190,11 @@ class DETR(nn.Module):
             loss += l1_weight * torch.sum(
                 torch.abs(pred_bbox[pred_indices] - gt_bbox[gt_indices])
             )
-            loss /= label.size(0)
             sum_losses += loss
+
+        num_objs = sum([label.size(0) for label in labels])
+        if num_objs != 0:
+            sum_losses /= num_objs
         sum_losses /= image.size(0)
         return sum_losses
 
@@ -201,6 +205,7 @@ if __name__ == "__main__":
     batch_size = 4
 
     model = DETR()
+
     num_objs = [random.randint(0, 20) for _ in range(batch_size)]
     labels = [torch.randint(0, model.num_classes, size=(i,)) for i in num_objs]
     gt_bboxes = [torch.rand((i, 4)) for i in num_objs]
