@@ -2,9 +2,8 @@
     # https://github.com/facebookresearch/detr/blob/main/models/matcher.py
 
 import sys
-sys.path.insert(0, "/home/jbkim/Desktop/workspace/DETR")
-# sys.path.insert(0, "/Users/jongbeomkim/Desktop/workspace/DETR")
-import scipy.optimize
+# sys.path.insert(0, "/home/jbkim/Desktop/workspace/DETR")
+sys.path.insert(0, "/Users/jongbeomkim/Desktop/workspace/DETR")
 import torch
 import torch.nn as nn
 from torchvision.models import resnet50
@@ -139,24 +138,48 @@ class DETR(nn.Module):
         x = self.transformer(
             image_feat=x,
             query=einops.repeat(
-                self.query, pattern="n d -> b n d", b=image.size(0),
+                self.query.to(image.device),
+                pattern="n d -> b n d",
+                b=image.size(0),
             ),
             out_pos_enc=einops.repeat(
-                self.obj_query, pattern="n d -> b n d", b=image.size(0),
+                self.obj_query.to(image.device),
+                pattern="n d -> b n d",
+                b=image.size(0),
             ),
         )
         pred_bbox = self.bbox_ffn(x)
         pred_prob = self.cls_ffn(x)
         return pred_bbox, pred_prob
 
+    @staticmethod
+    def norm_xywh_to_norm_ltrb(norm_xywh):
+        x, y, w, h = torch.unbind(norm_xywh, dim=-1)
+        return torch.stack([x - w / 2, y - h / 2, x + w / 2, y + h / 2], dim=-1)
+
+    def perform_bipartite_matching(
+        self, pred_norm_ltrb, pred_prob, gt_ltrb, label, l1_weight, iou_weight,
+    ):
+        iou_loss = model.giou_loss(pred_norm_ltrb, gt_ltrb)
+        l1_loss = torch.abs(
+            pred_norm_ltrb[:, None, :] - gt_ltrb[None, :, :]
+        ).sum(dim=-1)
+        box_loss = l1_weight * l1_loss + iou_weight * iou_loss
+        label_prob = pred_prob[:, label]
+        match_loss = box_loss - label_prob
+        pred_indices, gt_indices = scipy.optimize.linear_sum_assignment(
+            match_loss.detach().cpu().numpy(),
+        )
+        return pred_indices, gt_indices, box_loss, label_prob
+
     def get_loss(
         self,
         image,
+        gt_norm_ltrbs,
         labels,
-        gt_bboxes,
         no_obj_weight=0.1,
         l1_weight=5,
-        giou_weight=2,
+        iou_weight=2,
     ):
         """
         "$\mathcal{L}_{\text{match}}(y_{i}, \hat{y}_{\sigma(i)})$ is a pair-wise
@@ -174,6 +197,8 @@ class DETR(nn.Module):
         $\mathcal{L}_{\text{match}}(y_{i}, \hat{y}_{\sigma(i)})$ as
         $-\mathbb{1}_{\{c_{i} \neq \phi\}}\hat{p}_{\sigma(i)}(c_{i}) +
         \mathbb{1}_{\{c_{i} \neq \phi\}}\mathcal{L}_{\text{box}}(b_{i}, \hat{b}_{\sigma(i)})$.
+        "We down-weight the log-probability term when $c_{i} = \phi$ by a factor
+        10 to account for class imbalance."
         "We use linear combination of $\mathcal{l}$ and GIoU losses for bounding
         box regression with $\lambda_{L1} = 5$ and $\lambda_{\text{iou}} = 2$
         weights respectively."
@@ -183,52 +208,128 @@ class DETR(nn.Module):
         highest scoring class, using the corresponding confidence. This improves
         AP by 2 points compared to filtering out empty slots."
         """
-        batched_pred_bbox, batched_pred_prob = self(image)
+        out_norm_xywh, out_prob = self(image)
+        out_ltrb = self.norm_xywh_to_norm_ltrb(out_norm_xywh)
 
         sum_losses = torch.zeros((1,), dtype=torch.float32)
-        for pred_bbox, pred_prob, label, gt_bbox in zip(
-            batched_pred_bbox,
-            batched_pred_prob,
+        for pred_norm_ltrb, pred_prob, gt_ltrb, label in zip(
+            out_ltrb,
+            out_prob,
+            gt_norm_ltrbs,
             labels,
-            gt_bboxes
         ):
-            giou = self.giou_loss(pred_bbox, gt_bbox)
-            label_prob = pred_prob[:, label]
-            match_loss = -label_prob + giou
-            pred_indices, gt_indices = scipy.optimize.linear_sum_assignment(
-                match_loss.detach().cpu().numpy(),
+            (
+                pred_indices,
+                gt_indices,
+                box_loss,
+                label_prob,
+            ) = self.perform_bipartite_matching(
+                pred_norm_ltrb=pred_norm_ltrb,
+                pred_prob=pred_prob,
+                gt_ltrb=gt_ltrb,
+                label=label,
+                l1_weight=l1_weight,
+                iou_weight=iou_weight,
             )
-
-            loss = no_obj_weight * torch.sum(
-                -torch.log(label_prob[pred_indices, gt_indices])
+            cls_loss = -torch.log(label_prob[pred_indices, gt_indices]).sum()
+            no_obj_mask = ~torch.isin(
+                torch.arange(self.num_query_slots),
+                torch.from_numpy(pred_indices),
             )
-            loss += giou_weight * torch.sum(giou[pred_indices, gt_indices])
-            loss += l1_weight * torch.sum(
-                torch.abs(pred_bbox[pred_indices] - gt_bbox[gt_indices])
-            )
+            no_obj_cls_loss = -torch.log(
+                pred_prob[no_obj_mask, model.num_classes],
+            ).sum()
+            hungrian_cls_loss = cls_loss + no_obj_weight * no_obj_cls_loss
+            hungarian_box_loss = box_loss[pred_indices, gt_indices].sum()
+            loss = hungrian_cls_loss + hungarian_box_loss
+            # print(cls_loss)
+            # print(no_obj_cls_loss)
+            # print(hungarian_box_loss)
+            # print(loss)
             sum_losses += loss
-
         num_objs = sum([label.size(0) for label in labels])
         if num_objs != 0:
             sum_losses /= num_objs
-        sum_losses /= image.size(0)
+        # sum_losses /= image.size(0)
         return sum_losses
 
 
 if __name__ == "__main__":
-    import random
+    from utils import move_to_device
 
-    batch_size = 4
-
-    num_objs = [random.randint(0, 20) for _ in range(batch_size)]
-    labels = [torch.randint(0, model.num_classes, size=(i,)) for i in num_objs]
-    gt_bboxes = [torch.rand((i, 4)) for i in num_objs]
-
-    img_size = 480 + 16 * 52
-    model = DETR(img_size=img_size)
-
-    image = torch.randn((batch_size, 3, img_size, img_size))
+    _, _, img_size, _ = image.shape
+    device = torch.device("mps")
+    model = DETR(img_size=img_size).to(device)
     loss = model.get_loss(
-        image=image, labels=labels, gt_bboxes=gt_bboxes,
+        image=move_to_device(image, device),
+        gt_norm_ltrbs=move_to_device(annots["norm_ltrbs"], device),
+        labels=move_to_device(annots["labels"], device)
     )
-    print(loss)
+    loss
+    
+    # out_norm_xywh, out_prob = model(image)
+    # out_ltrb = model.norm_xywh_to_norm_ltrb(out_norm_xywh)
+    # out_ltrb.min()
+    # out_norm_xywh.shape
+    
+    
+    # import random
+
+    # batch_size = 4
+    # l1_weight = 1
+    # iou_weight = 1
+
+    # num_objs = [random.randint(0, 20) for _ in range(batch_size)]
+    # labels = [torch.randint(0, model.num_classes, size=(i,)) for i in num_objs]
+    # gt_norm_ltrbs = [torch.rand((i, 4)) for i in num_objs]
+
+
+    # img_size = 480 + 16 * 0
+    # print(loss)
+    # out_norm_xywh, out_prob = model(image)
+    # pred_norm_ltrb = out_norm_xywh[0]
+    # pred_prob = out_prob[0]
+    # gt_ltrb = gt_norm_ltrbs[0]
+    # label = labels[0]
+    # gt_ltrb.shape
+
+    # iou_loss = model.giou_loss(pred_norm_ltrb, gt_ltrb)
+    # l1_loss = torch.abs(pred_norm_ltrb[:, None, :] - gt_ltrb[None, :, :]).sum(dim=-1)
+    # box_loss = l1_weight * l1_loss + iou_weight * iou_loss
+    # label_prob = pred_prob[:, label]
+    # match_loss = box_loss - label_prob
+    # pred_indices, gt_indices = scipy.optimize.linear_sum_assignment(
+    #     match_loss.detach().cpu().numpy(),
+    # )
+
+    # hungarian_box_loss = box_loss[pred_indices, gt_indices].sum()
+    # no_obj_mask = ~torch.isin(torch.arange(100), torch.from_numpy(pred_indices))
+    # cls_loss = -torch.log(label_prob[pred_indices, gt_indices]).sum()
+    # no_obj_cls_loss = -torch.log(pred_prob[no_obj_mask, model.num_classes]).sum()
+    # loss = (cls_loss + no_obj_weight * no_obj_cls_loss) + hungarian_box_loss
+    # loss
+
+
+
+    # n_objs = label.size(0)
+    # new_label = F.pad(
+    #     label, pad=(0, model.num_query_slots - n_objs), value=model.num_classes,
+    # )
+    # new_gt_ltrb = F.pad(
+    #     gt_ltrb,
+    #     pad=(0, 0, 0, model.num_query_slots - n_objs),
+    #     value=0,
+    # )
+    # iou_loss = model.giou_loss(pred_norm_ltrb, new_gt_ltrb)
+    # l1_loss = torch.abs(pred_norm_ltrb[:, None, :] - new_gt_ltrb[None, :, :]).sum(dim=-1)
+    # box_loss = l1_weight * l1_loss + iou_weight * iou_loss
+    # label_prob = pred_prob[:, new_label]
+    # match_loss = box_loss - label_prob
+    # pred_indices, gt_indices = scipy.optimize.linear_sum_assignment(
+    #     match_loss.detach().cpu().numpy(),
+    # )
+    # pred_indices
+    # gt_indices
+
+    # no_obj_mask = gt_indices >= n_objs
+    # label_prob[pred_indices, gt_indices]

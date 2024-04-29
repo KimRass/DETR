@@ -2,25 +2,21 @@
 # References:
     # https://www.kaggle.com/code/blondinka/how-to-do-augmentations-for-instance-segmentation
 
-import sys
-sys.path.insert(0, "/home/jbkim/Desktop/workspace/DETR/")
+# import sys
+# sys.path.insert(0, "/home/jbkim/Desktop/workspace/DETR/")
 import torch
 import cv2
 from pycocotools.coco import COCO
 from pycocotools import mask as coco_mask
 from torch.utils.data import Dataset, DataLoader
-from torchvision.utils import (
-    make_grid,
-    draw_segmentation_masks,
-    draw_bounding_boxes,
-)
+from torchvision.utils import make_grid, draw_bounding_boxes
 from torchvision.ops import box_convert
 import torchvision.transforms.functional as TF
 from pathlib import Path
 import numpy as np
 
 from utils import COLORS, to_uint8, move_to_device
-from lsj import LargeScaleJittering
+from data.lsj import LargeScaleJittering
 
 
 class COCODS(Dataset):
@@ -42,12 +38,17 @@ class COCODS(Dataset):
         return len(self.img_ids)
 
     @staticmethod
-    def get_coco_bboxes(annots):
+    def get_xywhs(annots):
         return [annot["bbox"] for annot in annots]
 
     @staticmethod
     def get_labels(annots):
         return [annot["category_id"] for annot in annots]
+
+    def xywh_to_norm_ltrb(self, xywh):
+        x, y, w, h = torch.unbind(xywh, dim=-1)
+        ltrb = torch.stack([x - w / 2, y - h / 2, x + w / 2, y + h / 2], dim=-1)
+        return ltrb / self.img_size
 
     def __getitem__(self, idx):
         img_id = self.img_ids[idx]
@@ -58,47 +59,34 @@ class COCODS(Dataset):
 
         ann_ids = self.coco.getAnnIds(imgIds=img_id)
         annots = self.coco.loadAnns(ann_ids)
-        coco_bboxes = self.get_coco_bboxes(annots)
+        xywhs = self.get_xywhs(annots)
         labels = self.get_labels(annots)
-        # print(len(coco_bboxes), len(labels))
 
         if self.transform is None:
-            return img, coco_bboxes, labels
+            return img, xywhs, labels
         else:
-            if coco_bboxes and labels:
+            if xywhs and labels:
                 transformed = self.transform(
-                    image=img, bboxes=coco_bboxes, labels=labels,
+                    image=img, bboxes=xywhs, labels=labels,
                 )
-                coco_bboxes = transformed["bboxes"]
-                # bbox_ids = transformed["bbox_ids"]
+                xywhs = transformed["bboxes"]
                 labels = transformed["labels"]
             else:
                 transformed = self.transform(image=img)
-                # bbox_ids = []
             image = transformed["image"]
 
-            # print(len(coco_bboxes), len(labels))
-            # print(bbox_ids)
-            if coco_bboxes:
-                ltrb = torch.tensor(coco_bboxes, dtype=torch.float)
+            if xywhs:
+                xywh = torch.tensor(xywhs, dtype=torch.float)
             else:
-                ltrb = torch.empty(size=(0, 4), dtype=torch.float)
+                xywh = torch.empty(size=(0, 4), dtype=torch.float)
+            norm_ltrb = self.xywh_to_norm_ltrb(xywh)
             label = torch.tensor(labels, dtype=torch.long)
-            return image, ltrb, label
+            return image, norm_ltrb, label
 
     @staticmethod
     def collate_fn(batch):
-        images, coco_bboxes, labels = list(zip(*batch))
-        if coco_bboxes:
-            ltrbs = [
-                box_convert(boxes=coco_bbox, in_fmt="xywh", out_fmt="xyxy")
-                for coco_bbox
-                in coco_bboxes
-            ]
-        else:
-            ltrbs = []
-            
-        annots = {"ltrbs": ltrbs, "labels": labels}
+        images, norm_ltrbs, labels = list(zip(*batch))
+        annots = {"norm_ltrbs": norm_ltrbs, "labels": labels}
         return torch.stack(images, dim=0), annots
 
     def labels_to_class_names(self, labels):
@@ -153,19 +141,24 @@ class COCODS(Dataset):
 
 
 if __name__ == "__main__":
-    annot_path = "/home/jbkim/Documents/datasets/annotations_trainval2017/annotations/instances_train2017.json"
-    img_dir = "/home/jbkim/Documents/datasets/train2017/train2017"
+    # annot_path = "/home/jbkim/Documents/datasets/annotations_trainval2017/annotations/instances_train2017.json"
+    # img_dir = "/home/jbkim/Documents/datasets/train2017/train2017"
+    annot_path = "/Users/jongbeomkim/Documents/datasets/annotations/instances_train2017.json"
+    img_dir = "/Users/jongbeomkim/Documents/datasets/train2017"
     lsj = LargeScaleJittering()
     ds = COCODS(annot_path=annot_path, img_dir=img_dir, transform=lsj)
+    ds[0][1]
     # for idx in range(100):
-    #     img, coco_bboxes, labels = ds[idx]
-    #     img.shape, len(coco_bboxes), len(labels)
+    #     img, xywhs, labels = ds[idx]
+    #     img.shape, len(xywhs), len(labels)
 
     dl = DataLoader(
         ds, batch_size=4, shuffle=True, collate_fn=ds.collate_fn,
     )
     for batch_idx, (image, annots) in enumerate(dl):
-        vis_bef = ds.vis_annots(image=image, annots=annots)
-        vis_bef.show()
+        annots["norm_ltrbs"][2]
         break
+
+        # vis_bef = ds.vis_annots(image=image, annots=annots)
+        # vis_bef.show()
         # vis_bef.save(SAMPLES_DIR/f"{batch_idx}-original.jpg")
