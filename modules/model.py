@@ -2,8 +2,8 @@
     # https://github.com/facebookresearch/detr/blob/main/models/matcher.py
 
 import sys
-# sys.path.insert(0, "/home/jbkim/Desktop/workspace/DETR")
-sys.path.insert(0, "/Users/jongbeomkim/Desktop/workspace/DETR")
+sys.path.insert(0, "/home/jbkim/Desktop/workspace/DETR")
+# sys.path.insert(0, "/Users/jongbeomkim/Desktop/workspace/DETR")
 import scipy.optimize
 import torch
 import torch.nn as nn
@@ -27,14 +27,30 @@ class Backbone(nn.Module):
     Typical values we use are $C = 2048$ and $H, W = \frac{H_{0}}{32},
     \frac{W_{0}}{32}$."
     "The backbone is with ImageNet-pretrained ResNet model from `torchvision`
-    with frozen batchnorm layers. We report results with two different backbones:
-    a ResNet-50 and a ResNet-101. The corresponding models are called respectively
-    DETR and DETR-R101."
+    with frozen batchnorm layers."
     """
+    def freeze_bn2d_params(self):
+        for module in self.cnn.modules():
+            if isinstance(module, nn.BatchNorm2d):
+                module.weight.requires_grad = False
+                module.bias.requires_grad = False
+
+    def bn2d_params_to_buffers(self):
+        for module in self.cnn.modules():
+            if isinstance(module, nn.BatchNorm2d):
+                weight = module.weight
+                delattr(module, "weight")
+                module.register_buffer("weight", weight)
+
+                bias = module.bias
+                delattr(module, "bias")
+                module.register_buffer("bias", bias)
+
     def __init__(self):
         super().__init__()
 
         self.cnn = resnet50(weights=ResNet50_Weights.DEFAULT)
+        self.freeze_bn2d_params()
         self.cnn.avgpool = nn.Identity()
         self.cnn.fc = nn.Identity()
 
@@ -204,13 +220,14 @@ if __name__ == "__main__":
 
     batch_size = 4
 
-    model = DETR()
-
     num_objs = [random.randint(0, 20) for _ in range(batch_size)]
     labels = [torch.randint(0, model.num_classes, size=(i,)) for i in num_objs]
     gt_bboxes = [torch.rand((i, 4)) for i in num_objs]
 
-    image = torch.randn((4, 3, 512, 512))
+    img_size = 480 + 16 * 52
+    model = DETR(img_size=img_size)
+
+    image = torch.randn((batch_size, 3, img_size, img_size))
     loss = model.get_loss(
         image=image, labels=labels, gt_bboxes=gt_bboxes,
     )

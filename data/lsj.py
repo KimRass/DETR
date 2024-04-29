@@ -3,14 +3,7 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
 
-class DataAug(object):
-    """
-    "We use scale augmentation, resizing the input images such that the shortest
-    side is at least 480 and at most 800 pixels while the longest at most 1333.
-    we also apply random crop augmentations during training. A train image is
-    cropped with probability 0.5 to a random rectangular patch which is then
-    resized again to 800-1333."
-    """
+class LargeScaleJittering(object):
     def __init__(
         self,
         format="coco",
@@ -62,8 +55,3 @@ class DataAug(object):
                 bbox_ids=range(len(bboxes)),
                 labels=labels,
             )
-
-
-import numpy as np
-img = np.zeros(1024)
-A.LongestMaxSize
