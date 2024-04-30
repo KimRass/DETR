@@ -8,16 +8,18 @@ class LargeScaleJittering(object):
         self,
         format="coco",
         img_size=512,
-        pad_color=(127, 127, 127),
+        shift_limit=(-0.5, 0.5),
+        scale_limit=(-0.9, 1),
         mean=(0.485, 0.456, 0.406),
         std=(0.229, 0.224, 0.225),
+        pad_color=(127, 127, 127),
     ):
         self.img_size = img_size
         self.transform = A.Compose(
             [
                 A.ShiftScaleRotate(
-                    shift_limit=(-0.5, 0.5),
-                    scale_limit=(-0.9, 1),
+                    shift_limit=shift_limit,
+                    scale_limit=scale_limit,
                     rotate_limit=0,
                     border_mode=cv2.BORDER_CONSTANT,
                     value=pad_color,

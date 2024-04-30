@@ -44,7 +44,9 @@ def denorm(x, mean=(0.457, 0.437, 0.404), std=(0.275, 0.271, 0.284)):
 
 
 @torch.inference_mode()
-def image_to_grid(image, n_cols, padding=1, mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)):
+def image_to_grid(
+    image, n_cols, padding=1, mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5),
+):
     tensor = image.clone().detach().cpu()
     tensor = denorm(tensor, mean=mean, std=std)
     grid = make_grid(tensor, nrow=n_cols, padding=padding, pad_value=1)
@@ -115,30 +117,6 @@ def get_palette(n_classes):
     rand_perm2 = np.random.permutation(256)[: n_classes]
     rand_perm3 = np.random.permutation(256)[: n_classes]
     return np.stack([rand_perm1, rand_perm2, rand_perm3], axis=1)
-
-
-def colorize_mask(mask, color):
-    colored_mask = np.stack([mask] * 3, axis=-1)
-    for i in range(3):
-        colored_mask[..., i][colored_mask[..., i] == 255] = color[i]
-    return colored_mask
-
-
-def overlay_mask(img, mask, color, beta=0.8):
-    colored_mask = colorize_mask(mask * 255, color=color)
-    alpha = ((colored_mask > 0).max(axis=2) * 128).astype(np.uint8)            
-    rgba_mask = np.concatenate([colored_mask, alpha[:, :, None]], axis=2)
-    rgba_img = cv2.cvtColor(img, cv2.COLOR_RGB2RGBA)
-    rgba_img = cv2.addWeighted(rgba_img, 1, rgba_mask, beta, gamma=0)
-    return cv2.cvtColor(rgba_img, cv2.COLOR_RGBA2RGB)
-
-
-def overlay_masks(img, mask, palette, beta=0.8):
-    new_img = img.copy()
-    for mask_idx, gray_mask in enumerate(np.array(mask)):
-        color = palette[mask_idx]
-        new_img = overlay_mask(img=new_img, mask=gray_mask, color=color, beta=beta)
-    return new_img
 
 
 def to_uint8(image, mean, std):
